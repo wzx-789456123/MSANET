@@ -1,8 +1,4 @@
-# -----------------------------------------------------------------------------------
-# SwinIR: Image Restoration Using Swin Transformer, https://arxiv.org/abs/2108.10257
-# Originally Written by Ze Liu, Modified by Jingyun Liang.
-# 先STL+CTL，没有最后一个norm，全放在CTHB之中，先编码后解码,其中，第一个编码的norm关掉
-# -----------------------------------------------------------------------------------
+
 import math
 import torch
 import torch.nn as nn
@@ -46,27 +42,6 @@ class DropPath(nn.Module):
     def forward(self, x):
         return drop_path(x, self.drop_prob, self.training)
 
-
-# Ablation_MLP
-# class Mlp(nn.Module):  # 原来的MLP
-#     def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.GELU, drop=0.):
-#         super().__init__()
-#         out_features = out_features or in_features
-#         hidden_features = hidden_features or in_features
-#         self.fc1 = nn.Linear(in_features, hidden_features)
-#         self.act = act_layer()
-#         self.fc2 = nn.Linear(hidden_features, out_features)
-#         self.drop = nn.Dropout(drop)
-#
-#     def forward(self, x):
-#         x = self.fc1(x)
-#         x = self.act(x)
-#         x = self.drop(x)
-#         x = self.fc2(x)
-#         x = self.drop(x)
-#         return x
-
-# spatial-gate feed-forward network  SGFN/GFFB
 class Mlp(nn.Module):
 
     def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.GELU, drop=0.):
@@ -448,7 +423,6 @@ class BasicLayer_CTL(nn.Module):
         self.dim = dim
         self.conv_blocks = conv_blocks
 
-        # build ConvTransFormerBlocks
         self.ConvBlocks = nn.ModuleList([
             CTL(dim=dim, branch_ratio=branch_ratio, mlp_ratio=mlp_ratio, act_layer=act_layer)
             for _ in range(conv_blocks)])
@@ -459,9 +433,8 @@ class BasicLayer_CTL(nn.Module):
         return x
 
 
-class CTHB(nn.Module):
-    """Residual Swin Transformer Block (RSTB).
-
+class RG(nn.Module):
+    """
     Args:
         dim (int): Number of input channels.
         input_resolution (tuple[int]): Input resolution.
@@ -518,20 +491,9 @@ class CTHB(nn.Module):
         self.patch_unembed = PatchUnEmbed(
             img_size=img_size, patch_size=patch_size, in_chans=0, embed_dim=dim, norm_layer=None)
 
-    # 先STL+CTL，有最后一个norm，原来的，分开编码解码。   编码+norm(first)-解码-编码-----解码-编码--norm+解码(last)
-    # def forward(self, x, x_size):
-    #     return self.patch_embed(
-    #         self.residual_CTLGroup(self.patch_unembed(self.residual_STLGroup(x, x_size), x_size))) + x
-
-    # 先STL+CTL，没有最后一个norm，全放在CTHB之中(去掉了首尾的两个编码+norm和norm+解码)，先编码后解码
     def forward(self, x, x_size):
         x = self.residual_CTLGroup(self.patch_unembed(self.residual_STLGroup(self.patch_embed(x), x_size), x_size)) + x
         return x
-
-    # # CTL+STL，没有最后一个norm，全放在CTHB之中，只能编码-解码 循环。
-    # def forward(self, x, x_size):
-    #     x = self.patch_unembed(self.residual_STLGroup(self.patch_embed(self.residual_CTLGroup(x)), x_size), x_size) + x
-    #     return x
 
     def flops(self):
         flops = 0
@@ -543,8 +505,6 @@ class CTHB(nn.Module):
 
         return flops
 
-
-# 多尺度ConvFormer特征增强（混合）模块  Multi-scale Feature Enhance M
 class CTL(nn.Module):
     def __init__(self, dim, branch_ratio=0.25, mlp_ratio=2., act_layer=nn.GELU):
         super().__init__()
@@ -552,15 +512,14 @@ class CTL(nn.Module):
         self.norm1 = LayerNorm(dim)
         self.maca = MACA(dim, branch_ratio)
         self.norm2 = LayerNorm(dim)
-        self.gffb = GFFB(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer)
+        self.esgb = ESGB(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer)
 
     def forward(self, x):
         x = self.maca(self.norm1(x)) + x
-        x = self.gffb(self.norm2(x)) + x
+        x = self.esgb(self.norm2(x)) + x
         return x
 
 
-# Multi-scale Asymmetric feature Extraction Block  yuan  多尺度非对称深度卷积注意
 class MACA(nn.Module):
     def __init__(self, dim, branch_ratio=0.25):
         super().__init__()
@@ -602,8 +561,7 @@ class MACA(nn.Module):
         return out
 
 
-# Gated-Partial convolution Feed-Forward Network（block） MLP   原PFFB
-class GFFB(nn.Module):
+class ESGB(nn.Module):
     def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.GELU):
         super().__init__()
         out_features = out_features or in_features
@@ -772,11 +730,8 @@ class UpsampleOneStep(nn.Sequential):
         return flops
 
 
-@ARCH_REGISTRY.register()
-class CTHN(nn.Module):
-    r""" SwinIR
-        A PyTorch impl of : `SwinIR: Image Restoration Using Swin Transformer`, based on Swin Transformer.
-
+class MASNet(nn.Module):
+    """
     Args:
         img_size (int | tuple(int)): Input image size. Default 64
         patch_size (int | tuple(int)): Patch size. Default: 1
@@ -860,7 +815,7 @@ class CTHN(nn.Module):
         # build Residual Swin Transformer blocks (RSTB)
         self.layers = nn.ModuleList()
         for i_layer in range(self.num_layers):
-            layer = CTHB(dim=embed_dim,
+            layer = RG(dim=embed_dim,
                          input_resolution=(patches_resolution[0], patches_resolution[1]),
                          depth=depths[i_layer], conv_blocks=conv_blocks, num_heads=num_heads[i_layer],
                          window_size=window_size, mlp_ratio=self.mlp_ratio, act_layer=act_layer,
@@ -1011,22 +966,11 @@ if __name__ == '__main__':
     window_size = 8
     height = (1024 // upscale // window_size + 1) * window_size
     width = (720 // upscale // window_size + 1) * window_size
-    model = CTHN(upscale=2, img_size=(height, width),
+    model = MSANet(upscale=2, img_size=(height, width),
                  window_size=window_size, img_range=1., depths=[4, 4, 4], conv_blocks=4,
                  embed_dim=60, num_heads=[6, 6, 6, 6], mlp_ratio=2, upsampler='pixelshuffledirect')
-    # print(model)
-    # # print(height, width, model.flops() / 1e9)
-    #
-    # x = torch.randn((1, 3, height, width))
-    # x = model(x)
-    # print(x.shape)
-    # x = torch.randn(1, 3, 640, 360)
-    # x = torch.randn(1, 3, 427, 240)
-    # x = torch.randn(1, 3, 320, 180)
+
     x = torch.randn(1, 3, height, width)
 
     print(f'params: {sum(map(lambda x: x.numel(), model.parameters()))}')
-    # print(flop_count_table(FlopCountAnalysis(model, x), activations=ActivationCountAnalysis(model, x)))
-    # output = model(x)
-    # print(output.shape)
-    # print(model)
+
